@@ -8,6 +8,8 @@ from datetime import datetime
 import numpy as np
 import pickle
 from mixture import *
+from models.distributions import *
+from models.truncated_normal import *
 
 '''
 This script contains implementations on Gaus, Flow and Mix. QAVI
@@ -17,15 +19,16 @@ class Gaus_QAVI(VAE):
 		super().__init__(configs)
 		self.file_name = configs.model.path + 'results/qavi/gaus/'
 		self.params = [{} for i in range(1000)] 
+		check_directory(self.file_name)
 
-	def b_init_params(self,b_data):
+	def b_init_params(self,b_data, b_mask=None):
 		params  = self.encoder.forward(b_data)
 		params[...,self.latent_dim:] = torch.ones(b_data.shape[0], self.latent_dim)
 		params = params.cuda()
 		return params
 
-	def init_params(self, b_data):
-		params = self.b_init_params(b_data)
+	def init_params(self, b_data, b_mask=None):
+		params = self.b_init_params(b_data, b_mask)
 		return params
                 
 	def get_params(self, b_data, b_mask, i, m_type=None):
@@ -50,13 +53,13 @@ class Gaus_QAVI(VAE):
 
 		input_flat = b_data.reshape([-1, 1])
 		b_mask = b_mask.reshape([batch_size, dims])
+
 		recon_prob = self.recon_prob(recon,input_flat).reshape([batch_size,dims])
 		recon_prob_batch = torch.sum(recon_prob*b_mask,[1]).reshape(K,n_images)
 
 		kld = self.latent_loss(q_z, z, params).reshape(n_images) 
 		loss = -torch.mean(torch.mean(recon_prob_batch,0) - self.configs.qavi.beta*kld)
 		nelbo = -torch.mean(torch.mean(recon_prob_batch,0) - kld)
-		#print(loss)
 		return {"loss" : loss, "recon_prob": torch.mean(recon_prob_batch), "kl" : torch.mean(kld), "nelbo": nelbo}
 
 	def params_train(self, params):
@@ -84,8 +87,7 @@ class Gaus_QAVI(VAE):
 
 	def train_mini_batch(self, iterations, K, data_args): 
 		[data, mask, full] = data_args
-		params = self.init_params(data)
-		data_ = data_replicate(data, K)
+		params = self.init_params(data, mask)
 		mask_ = data_replicate(mask, K)
 		full_ = data_replicate(full, K)
 
@@ -94,27 +96,28 @@ class Gaus_QAVI(VAE):
 		loss_batch, nelbo_batch, time_batch = np.zeros(iterations), np.zeros(iterations),np.zeros(iterations)
 		k1 = 50 
 		start = datetime.now()
+        
 		for k in range(iterations):
+			data_ = data_replicate(data, K)
 			if k == k1 : params, optimizers, schedulers = self.phase_one(params, optimizers, schedulers, k)
 			if k == int(2*iterations/3): params, optimizers, schedulers = self.phase_two(params, optimizers, schedulers, k)
-			loss_ = self.loss(data_, mask_, params, K)
 			for opt in optimizers: opt.zero_grad()
+			loss_ = self.loss(data_, mask_, params, K)
 			loss_["loss"].backward()
+            
 			for opt in optimizers: opt.step()
 			for sch in schedulers: sch.step()
-            
 			if k%int((k1+1)/5)==0 and k<=k1-1: params, optimizers = self.re_init(data, params, optimizers)
 			loss_batch[k] += loss_["loss"].item()
 			nelbo_batch[k] += loss_["nelbo"].item()
 			end = datetime.now()    
-			diff = end-start 
+			diff = end - start 
 			time_batch[k] += diff.total_seconds()
-			if k%50==0: print(k, loss_["loss"].item())
-
-            
+			#if k%50==0: print(k, loss_["loss"].item())
+        
 		params = self.params_eval(params)
 		return params, [loss_batch, nelbo_batch, time_batch]        
-   
+
 	def train(self, iterations, K, data, m_type=None): 
 		batches = self.configs.qavi.batches
 		[b_data, b_mask, b_full] = data
@@ -124,7 +127,6 @@ class Gaus_QAVI(VAE):
 		loss_batch, nelbo_batch, time_batch = np.zeros(iterations), np.zeros(iterations),np.zeros(iterations)
 		params = []        
 		for j in range(n_batches):
-			print(j)
 			mini_b_data = jth_batch(b_data, j, batches/K)
 			mini_b_mask = jth_batch(b_mask, j, batches/K)
 			mini_b_full = jth_batch(b_full, j, batches/K)
@@ -136,49 +138,51 @@ class Gaus_QAVI(VAE):
 			nelbo_batch +=  stats[1]              
 			time_batch +=  stats[2]  
 			params.append(params_batch)
-            
-		loss_trace.append(loss_batch/j)
-		nelbo_trace.append(nelbo_batch/j)
-		time_trace.append(time_batch/j)
+			
+		loss_trace.append(loss_batch/n_batches)
+		nelbo_trace.append(nelbo_batch/n_batches)
+		time_trace.append(time_batch/n_batches)
 
 		if m_type is not None: s_file(self.file_name + m_type + "/traces.pkl", [loss_trace, nelbo_trace, time_trace], 'ab+') 
 		return params
    
-	def show_imputations(self, data_loader, m_type=None):
+	def show_imputations(self, data_loader, m_type=None, feat_space=False):
 		num_batches = len(data_loader)
 		read_only = False
-
 		if not os.path.exists(self.file_name + m_type):
 			os.mkdir(self.file_name + m_type)     
-            
+
 		if os.path.exists(self.file_name + m_type + "/parameters.pkl") and check_file(self.file_name + m_type + "/parameters.pkl", num_batches*int(self.configs.qavi.batches/self.configs.qavi.K)): 
 			print("parameters available, reading file instead of training") 
 			read_only = True
-            
+
 		for i, data in enumerate(data_loader): 
 			b_data, b_mask, b_full = data[0:3]
-			b_data = b_data.to(device,dtype = torch.float)
-			b_mask = b_mask.to(device,dtype = torch.bool)
-			b_full = b_full.to(device,dtype = torch.float)
+			b_data = b_data.cuda().float()
+			b_mask = b_mask.cuda().bool()
+			b_full = b_full.cuda().float()
 
 			if not read_only: params = self.train(self.configs.qavi.iterations, self.configs.qavi.K, [b_data, b_mask, b_full], m_type) 
 			else: params =  self.get_params(b_data, b_mask, i, m_type)
             
 			if i == (num_batches - 1):
-				print("Displaying imputations for 10 test data points")
 				mini_b_data = jth_batch(b_data, 0, int(self.configs.qavi.batches/self.configs.qavi.K))
 				mini_b_mask = jth_batch(b_mask, 0, int(self.configs.qavi.batches/self.configs.qavi.K))
 				mini_b_full = jth_batch(b_full, 0, int(self.configs.qavi.batches/self.configs.qavi.K))
-				imputations = self.impute(mini_b_data, mini_b_mask, params[0], K=10, batches=100) # K, batch_size, channels, p, q
+				imputations = self.impute(mini_b_data, mini_b_mask, params[0], K=10, batches=100,feat_space=feat_space) # K, batch_size, channels, p, q
+				print("Displaying imputations for %s test data points", (mini_b_data.shape[0]))
 				show_images(mini_b_data, mini_b_full, imputations)
+				break
     
 
 class Flow_QAVI(Gaus_QAVI):
 	def __init__(self, configs, test_loader=None):
 		super().__init__(configs)
 		self.file_name = configs.model.path + 'results/qavi/flow/'
+		check_directory(self.file_name)
 
-	def init_params(self, mini_b_data):
+
+	def init_params(self, mini_b_data, mini_b_mask=None):
 		base_params = self.b_init_params(mini_b_data)
 		batch_size = mini_b_data.shape[0]
 		autoregressive_nn =  AutoRegressiveNN(self.latent_dim, [320, 320]).cuda()
@@ -241,8 +245,9 @@ class Mix_QAVI(Gaus_QAVI):
 		super().__init__(configs)
 		self.num_components = 10
 		self.file_name = configs.model.path + 'results/qavi/mix/'
+		check_directory(self.file_name)
 
-	def b_init_params(self, b_data, r1=-1, r2=1):
+	def b_init_params(self, b_data, b_mask=None, r1=-1, r2=1):
 		batch_size = b_data.shape[0]
 		out_encoder = self.encoder.forward(b_data) #.reshape((batch_size, num_components, 2*d))
 		out_encoder = data_replicate(out_encoder, self.num_components).reshape((batch_size, self.num_components, 2*self.latent_dim))
@@ -314,9 +319,9 @@ class Mix_QAVI(Gaus_QAVI):
 		return approx_latent_loss(self.p_z, q_z, z, params)
 
 	def params_train(self, params): 
-		params["logits"] = params["logits"].to(device,dtype = torch.float)
-		params["means"] = params["means"].to(device,dtype = torch.float)
-		params["log_std"]= params["log_std"].to(device,dtype = torch.float)
+		params["logits"] = params["logits"].cuda().float() 
+		params["means"] = params["means"].cuda().float()
+		params["log_std"]= params["log_std"].cuda().float()
 
 		params["logits"].requires_grad = False
 		params["means"].requires_grad = True
@@ -328,3 +333,84 @@ class Mix_QAVI(Gaus_QAVI):
 		params["means"].requires_grad = False
 		params["log_std"].requires_grad = False
 		return params
+
+class Feat_QAVI(Gaus_QAVI):
+	def __init__(self, configs, test_loader=None):
+		super().__init__(configs)
+		self.file_name = configs.model.path + 'results/qavi/feat/'
+		check_directory(self.file_name)
+		self.configs.qavi.beta = 50
+		self.configs.qavi.gamma = 10
+		self.configs.qavi.batches = 100
+
+	def b_init_params(self,b_data, b_mask):
+		mp = int(len(b_data[~b_mask]))
+
+		#params = torch.rand(2*mp).cuda()
+		#params[:mp] = 2*(params[:mp] - 0.5)
+		#params[mp:] = torch.ones(mp)
+
+		if self.configs.dist.data == "ContBernoulli": 
+			params = torch.rand(mp)
+			#params = 10*params[:mp] #torch.rand(mp) 
+			#params =  torch.clamp(params, min=-10, max=10)
+		if self.configs.dist.data == "DiscNormal": 
+			params = 2*(torch.rand(2*mp) - 0.5)
+			params[:mp] = torch.rand(mp) 
+		params = params.cuda()
+		return params
+   
+	def get_optimizers(self, params) : 
+		[lr, step_size, gamma] = [1.0, 100, 0.1]
+		if self.configs.dist.data != "ContBernoulli": lr = 0.1
+		optimizer = torch.optim.Adam([params], lr=lr, betas=(0.9, 0.999))
+		scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+		return [optimizer], [scheduler]
+
+	def feat_samples(self, params, K):
+		mp = len(params.detach())
+		if self.configs.dist.data == "DiscNormal":
+			q_xm = DiscNormal(loc = params[:int(mp/2)].reshape([1,-1]), scale = torch.nn.Softplus()(params[int(mp/2):]).reshape([1,-1]), device="cuda:0")
+			samples = q_xm.rsample([K])
+		elif self.configs.dist.data == "Normal":
+			q_xm = td.Normal(loc = params[:int(len(params)/2)].reshape([1,-1]), scale = (0.001 + torch.nn.Softplus()(params[int(mp/2):])).reshape([1,-1]))
+		elif self.configs.dist.data == "ContBernoulli":
+			samples = continuous_bernoulli(params).dist.rsample([K]) 
+		return samples, q_xm
+
+	def get_latent_params(self, b_data, b_mask, params, K ):
+		iota_x = b_data
+		samples, q_xm = self.feat_samples(params, K)
+		iota_x[~b_mask] = samples.reshape(-1) 
+		return iota_x, self.encode(iota_x).reshape([b_data.shape[0],2*self.configs.dist.latent_dim]), q_xm
+        
+	def loss(self, b_data, b_mask, params, K=100):
+		batch_size = b_data.shape[0]
+		n_images = int(batch_size/K)
+		dims = int(np.prod(b_data.shape)/batch_size)
+        
+		iota_x, latent_params, q_xm = self.get_latent_params(b_data, b_mask, params, K) 
+		z, q_z = self.posterior_sample(latent_params)
+		recon = self.decode(z)
+        
+		if self.configs.data.dataset =='SVHN': iota_x = torch.clamp(iota_x, min=-1, max=1)
+
+		input_flat = iota_x.reshape([-1, 1])
+		b_mask = b_mask.reshape([batch_size, dims])
+		recon_prob = self.recon_prob(recon,input_flat).reshape([batch_size,dims])
+		recon_prob_batch = torch.sum(recon_prob,[1]).reshape(K,n_images)
+		q_entropy = torch.tensor(0).cuda().float() 
+        
+		if self.configs.dist.data == "ContBernoulli":
+			for x in params: 
+				q_entropy += entropy(x) 
+		else:
+			q_entropy = torch.sum(q_xm.entropy())
+		        
+		kld = self.latent_loss(None, z, latent_params).reshape(K,n_images) 
+		loss = - (torch.mean(recon_prob_batch - self.configs.qavi.beta*kld) + self.configs.qavi.gamma *q_entropy) 
+
+		#loss = - (torch.mean(torch.mean(recon_prob_batch,0) - self.configs.qavi.beta*kld) + self.configs.qavi.gamma * q_entropy)
+		nelbo = - (torch.mean(torch.mean(recon_prob_batch,0) - kld) + q_entropy)
+		return {"loss" : loss, "recon_prob": torch.mean(recon_prob_batch), "kl" : torch.mean(kld), "nelbo": nelbo}
+    

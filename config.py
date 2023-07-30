@@ -27,7 +27,7 @@ def mnist_configs():
 	dist.min_std = 0
 	dist.data = "ContBernoulli"
 
-	#optimization
+	#base VAE optimization
 	config.optim = optim = ml_collections.ConfigDict()
 	optim.lr = 1e-3
 	optim.optimizer = "Adam"
@@ -69,11 +69,18 @@ def svhn_configs():
 	dist.min_std = 1e-2
 	dist.data = "DiscNormal"
 
-	#optimization
+	#base VAE optimization
 	config.optim = optim = ml_collections.ConfigDict()
 	optim.lr = 1e-4
 	optim.optimizer = "Adam"
 	optim.epochs = 100
 
+	#QAVI hyperparameters
+	config.qavi = qavi = ml_collections.ConfigDict()
+	qavi.beta = 20
+	qavi.batches = 1000
+	qavi.K = 100
+	qavi.iterations = 300
+    
 	return config
 

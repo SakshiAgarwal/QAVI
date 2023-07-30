@@ -6,15 +6,15 @@ from models.distributions import *
 from utils import *
 import os
 import numpy as np
+from models.truncated_normal import *
 
 device = torch.device('cuda:'+str(0) if torch.cuda.is_available() else 'cpu')
 def load_baseVAE(datatype, configs, train_loader):
 	if configs.model.act == "gelu": configs.model.activation = torch.nn.functional.gelu
-	else: configs.model.act = nn.LeakyReLU()
+	else: configs.model.activation = nn.LeakyReLU()
 
 	vae = VAE(configs, train_loader)
 	return vae
-
 
 def load_checkpoint(path, network):
 	checkpoint = torch.load(path, map_location='cuda:0') 
@@ -38,8 +38,8 @@ class VAE(nn.Module):
 		self.encoder = self.encoder.cuda()
 		self.decoder = self.decoder.cuda()
         
-		if os.path.exists(configs.model.path+ 'trained_models/decoder.pt') :
-			self.load_encoder(self.PATH+ 'trained_models/encoder.pt')
+		if os.path.exists(configs.model.path+ 'pre_trained_models/decoder.pt') :
+			self.load_encoder(self.PATH+ 'pre_trained_models/encoder.pt')
 			self.load_decoder()
 		else:
 			self.train(data_loader)
@@ -57,7 +57,7 @@ class VAE(nn.Module):
 		self.encoder = load_checkpoint(path , self.encoder)
 		
 	def load_decoder(self):
-		self.decoder = load_checkpoint(self.PATH + 'trained_models/decoder.pt', self.decoder)
+		self.decoder = load_checkpoint(self.PATH + 'pre_trained_models/decoder.pt', self.decoder)
 
 	def start_train(self):
 		self.encoder.train()
@@ -108,19 +108,22 @@ class VAE(nn.Module):
 		elif form == 'ContBernoulli':
 			return continuous_bernoulli(out)
 		else:
-			raise Exception('Distribution form not found.')
-            
+			raise NotImplementedError(f"Distribution {form} unknown.")            
             
 	def output_dist_mean(self, x):
 		dist = self.data_dist(x, self.configs.dist.data)
-		return dist, dist.mean()
+		if self.configs.dist.data == "DiscNormal": mean = x
+		else : mean = dist.mean()
+		return dist, mean
 
-	def impute(self, b_data, b_mask, params, K, batches=100):
+	def impute(self, b_data, b_mask, params, K, batches=100, feat_space=False):
 		if len(b_data.shape) == 2: [batch_size, p] = b_data.shape
 		else: [batch_size, channels, p, q] = b_data.shape
 
 		batch_size = b_data.shape[0]
 		dims = int(np.prod(b_data.shape)/batch_size)
+
+		if batches>K*batch_size: batches = K*batch_size
 		n_batches = int((K*batch_size)/batches) 
 		samples_per_batch = int(batches/batch_size) 
 
@@ -129,11 +132,19 @@ class VAE(nn.Module):
 		imputation_miss = data_replicate(b_data, K) 
 
 		for i in range(n_batches):
-			z, q_z = self.posterior_sample(params, samples_per_batch)
-			z = z.reshape([samples_per_batch*batch_size, self.latent_dim])
-			decoder_out = self.decode(z)
 			imputations = data_tiled
-			imputations[~mask] = self.output_dist_mean(decoder_out)[1].reshape([samples_per_batch*batch_size,channels,p,q])[~mask]
+
+			if feat_space: 
+				out, q_xm = self.feat_samples(params, samples_per_batch)
+				x_hat = data_tiled
+				x_hat[~mask] =  self.output_dist_mean(out)[1].reshape(-1)
+				out = self(x_hat)[0]
+			else: 
+				z, q_z = self.posterior_sample(params, samples_per_batch)
+				z = z.reshape([samples_per_batch*batch_size, self.latent_dim])
+				out = self.decode(z)
+				
+			imputations[~mask] = self.output_dist_mean(out)[1].reshape([samples_per_batch*batch_size,channels,p,q])[~mask]
 			imputation_miss[i*batches: (i+1)*batches] = imputations[:]
 
 		return imputation_miss.reshape(K,batch_size, channels,p,q)
@@ -141,7 +152,7 @@ class VAE(nn.Module):
 	def get_log_qz(self,q_z, z):
 		return q_z.log_prob(z)
     
-	def iwae(self, b_data, b_mask, b_full, params, K, batches=1000):
+	def iwae(self, b_data, b_mask, b_full, params, K, batches=1000, feat_space=False):
 		[batch_size, channels, p, q] = b_data.shape
 		n_batches = int((K*batch_size)/batches)
 		samples_per_batch = int(batches/batch_size) 
@@ -159,7 +170,13 @@ class VAE(nn.Module):
 		data_flat = full_.reshape([-1,1])
 
 		for i in range(n_batches):
-			z, q_z = self.posterior_sample(params, samples_per_batch)
+			if feat_space: 
+				iota_x, latent_params, q_xm = self.get_latent_params(data_tiled, mask, params, samples_per_batch) 
+				latent_params = self.encode(iota_x)
+				z, q_z = self.posterior_sample(latent_params, 1)
+			else:
+				z, q_z = self.posterior_sample(params, samples_per_batch)
+
 			logqz_batch = self.get_log_qz(q_z, z).reshape(batches,1)
 			logqz[i*batches: (i+1)*batches] = logqz_batch
 			logpz[i*batches: (i+1)*batches] = p_z.log_prob(z).reshape(batches,1) 
@@ -195,11 +212,13 @@ class VAE(nn.Module):
 	def get_params(self, b_data, b_mask = None, i=None):
 		return self.encode(b_data)
 
-	def evaluate_batch(self, batch_data, params):
+	def evaluate_batch(self, batch_data, params, feat_space=False):
 		n_mini_batches = int(self.configs.qavi.batches/self.configs.qavi.K)
 		[b_data, b_mask, b_full] = batch_data
+
 		if len(b_data.shape) ==2: [batch_size, p] = b_data.shape
 		else:  [batch_size, channels, p, q] = b_data.shape
+
 		iwae_batch = np.zeros((10000,batch_size))
 		mse_batch = np.zeros((10000,batch_size))
 		imputation_batch = data_replicate(b_data, 100).reshape([100, batch_size, channels, p, q])
@@ -208,8 +227,8 @@ class VAE(nn.Module):
 			mini_b_data = jth_batch(b_data, j, n_mini_batches)
 			mini_b_mask = jth_batch(b_mask, j, n_mini_batches)
 			mini_b_full = jth_batch(b_full, j, n_mini_batches)
-			iwae, mse = self.iwae(mini_b_data, mini_b_mask, mini_b_full, params[j], K=10000, batches=1000) # K , batch_size
-			imputations = self.impute(mini_b_data, mini_b_mask, params[j], K=100, batches=100) # K, batch_size, channels, p, q
+			iwae, mse = self.iwae(mini_b_data, mini_b_mask, mini_b_full, params[j], K=10000, batches=1000, feat_space=feat_space) # K , batch_size
+			imputations = self.impute(mini_b_data, mini_b_mask, params[j], K=100, batches=100, feat_space=feat_space ) # K, batch_size, channels, p, q
 			##Put the iwae, mse, imputations for the batch
 			iwae_batch[:,j*n_mini_batches: (j+1)*n_mini_batches] = iwae
 			mse_batch[:,j*n_mini_batches: (j+1)*n_mini_batches] = mse
@@ -217,7 +236,7 @@ class VAE(nn.Module):
 
 		return [iwae_batch, mse_batch, imputation_batch]
 
-	def evaluate(self, data_loader, m_type=None):
+	def evaluate(self, data_loader, m_type=None, feat_space=False):
 		num_batches = len(data_loader)
 		if not os.path.exists(self.file_name+m_type + "/parameters.pkl"):
 			print("parameters aren't saved.... can't proceed for evaluations... returning")
@@ -245,7 +264,7 @@ class VAE(nn.Module):
 			if read_only: 
 				stats = stats_full[i]
 			else: 
-				stats = self.evaluate_batch([b_data, b_mask, b_full], params) 
+				stats = self.evaluate_batch([b_data, b_mask, b_full], params, feat_space) 
 				s_file(self.file_name + m_type + "/evaluations.pkl", stats, 'ab+') 
              
 			n_mask = torch.sum(~b_mask, (1,2,3)).cpu().data.numpy()/channels   
@@ -270,6 +289,7 @@ class VAE(nn.Module):
 
 	def recon_prob(self, out_decoder, input_):
 		out_dist = self.data_dist(out_decoder, self.configs.dist.data) 
+		if self.configs.dist.data == "DiscNormal" : input_ = torch.clamp(input_, min=-1, max=1)
 		all_log_pxgivenz = out_dist.log_prob(input_)
 		return all_log_pxgivenz
 

@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 import pickle
 import os
 
+def check_directory(filename):
+		if not os.path.exists(filename):
+			os.mkdir(filename)
+
 def s_file(filename, x, mode="wb"):
 	with open(filename, mode) as file:
 		pickle.dump(x, file)
@@ -26,6 +30,7 @@ def check_file(filename, num_lines):
 			try:
 				data = pickle.load(f)
 				i+=1
+				print(i)
 			except EOFError as exc:
 				return i == num_lines
             
@@ -60,18 +65,19 @@ def jth_batch( data, j, batch_size):
 	return  data[int(j*batch_size) : int((j+1)*batch_size) ]
 
 
-def show_images(b_data, b_full, imputations, data='mnist'):
+def show_images(b_data, b_full, imputations):
 	[K, batch_size, channels,p,q] = imputations.shape
 	fig = plt.figure(figsize=(6, 6))
 	# setting values to rows and column variables
-	rows = 10 #n_images
+	
+	rows = b_data.shape[0] #n_images
 	columns = 10 #K imputations
 
 	for i in range(rows):
 		for j in range(columns):
 			fig.add_subplot(rows, columns, i*columns + j +1)
 			# showing image
-			if data=='mnist': 
+			if channels==1: 
 				if j == 0: a = np.squeeze(b_full[i].cpu().data.numpy().reshape(1,1,28,28))
 				elif j == 1: a = np.squeeze(b_data[i].cpu().data.numpy().reshape(1,1,28,28))
 				else : a = np.squeeze(imputations[j,i].cpu().data.numpy().reshape(1,1,28,28))
@@ -79,7 +85,9 @@ def show_images(b_data, b_full, imputations, data='mnist'):
 			else: 
 				#print(i,j)
 				#print(imputation_miss[i,j].shape)
-				a = np.transpose(expit(imputation_miss[j,i].cpu().data.numpy()), (1,2,0))
+				if j == 0: a = np.transpose(0.5+0.5*b_full[i].cpu().data.numpy(), (1,2,0)) 
+				elif j == 1: a = np.transpose(0.5+0.5*b_data[i].cpu().data.numpy(), (1,2,0))
+				else : a = np.transpose(0.5+0.5*imputations[j,i].cpu().data.numpy(), (1,2,0))
 				plt.imshow(a)
 			plt.axis('off')
 	plt.show()
@@ -92,3 +100,8 @@ def mse_(xhat, xtrue, data='mnist'): # MSE function for imputations
 	num_missing = xhat.shape[1]
 	return np.sum(np.power(xhat-xtrue,2),1) #/num_missing
 
+def entropy(x):
+    if torch.is_nonzero(x) : 
+        return 1 -  x/(1-torch.exp(-x)) - torch.log(x/(torch.exp(x)-1)) 
+    else :
+        return torch.tensor(0).cuda().float() 

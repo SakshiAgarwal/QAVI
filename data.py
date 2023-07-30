@@ -18,7 +18,6 @@ def load_file(filename):
 
 	return images, labels
 
-
 def save_file(filename, images, labels): 
 	s_file(filename + ".pkl", images)
 	s_file(filename + "_labels.pkl", labels)
@@ -143,7 +142,7 @@ class load_dataset(Dataset):
 		elif miss_string == '10random':
 			self.masks = random_miss(n,p,q,10*10*2)
 		elif miss_string == 'random':       
-			file_mask = "data/randommask_" + data_type + "_" + mode + ".pkl" 
+			file_mask = data_type+"/data/randommask_" + data_type + "_" + mode + ".pkl" 
 			if os.path.exists(file_mask):
 				with open(file_mask, 'rb') as file:
 					self.masks = pickle.load(file)
