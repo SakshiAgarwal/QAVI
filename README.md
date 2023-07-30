@@ -1,6 +1,6 @@
 # Query-Adaptive Variational Inference
 
-Missing Data Completion using (Hierarchical) Variational Auto-Encoders. 
+Missing Data Completion using (Hierarchical) Variational Auto-Encoders. You can find a quick explanation of QAVI [here](https://www.youtube.com/watch?v=O6iV9uOxRA4&feature=youtu.be&ab_channel=SakshiAgarwal).
 
 ## Setup
 
